@@ -1,38 +1,39 @@
 const fs = require('fs-extra')
-const util = require('util')
 const path = require('path')
 const { URL } = require('url')
-const { app, ipcMain } = require('electron')
-const { sleep, request, sendMsg, readJSON, saveJSON, userDataPath, userPath, localIp, langMap } = require('./utils')
+const { app, ipcMain, shell, clipboard } = require('electron')
+const { readdir, sleep, request, sendMsg, readJSON, saveJSON, userDataPath, userPath, localIp, langMap, getCacheText } = require('./utils')
 const config = require('./config')
+const getItemTypeNameMap = require('./gachaTypeMap').getItemTypeNameMap
 const i18n = require('./i18n')
 const { enableProxy, disableProxy } = require('./module/system-proxy')
 const mitmproxy = require('./module/node-mitmproxy')
 
 const dataMap = new Map()
-const order = ['301', '302', '200', '100']
-let apiDomain = 'https://hk4e-api.mihoyo.com'
+let apiDomain = 'https://public-operation-hk4e.mihoyo.com'
 
 const saveData = async (data, url) => {
   const obj = Object.assign({}, data)
   obj.result = [...obj.result]
   obj.typeMap = [...obj.typeMap]
-  config.urls.set(data.uid, url)
-  await config.save()
+  if (url) {
+    config.urls.set(data.uid, url)
+    await config.save()
+  }
   await saveJSON(`gacha-list-${data.uid}.json`, obj)
 }
 
 const defaultTypeMap = new Map([
   ['301', '角色活动祈愿'],
   ['302', '武器活动祈愿'],
+  ['500', '集录祈愿'],
   ['200', '常驻祈愿'],
   ['100', '新手祈愿']
 ])
 
 let localDataReaded = false
-const readdir = util.promisify(fs.readdir)
-const readData = async () => {
-  if (localDataReaded) return
+const readData = async (force = false) => {
+  if (localDataReaded && !force) return
   localDataReaded = true
   await fs.ensureDir(userDataPath)
   const files = await readdir(userDataPath)
@@ -116,7 +117,7 @@ const mergeData = (local, origin) => {
   return origin.result
 }
 
-const detectGameLocale = async (userPath) => {
+const detectGameType = async (userPath) => {
   let list = []
   const lang = app.getLocale()
   try {
@@ -130,14 +131,21 @@ const detectGameLocale = async (userPath) => {
   if (config.logType) {
     if (config.logType === 2) {
       list.reverse()
+    } else if (config.logType === 3) {
+      list = []
     }
     list = list.slice(0, 1)
   } else if (lang !== 'zh-CN') {
     list.reverse()
   }
+  try {
+    await fs.access(path.join(userPath, '/AppData/Local/', 'miHoYo/GenshinImpactCloudGame/config/logs/MiHoYoSDK.log'), fs.constants.F_OK)
+    list.push('cloud')
+  } catch (e) {}
   return list
 }
 
+let cacheFolder = null
 const readLog = async () => {
   const text = i18n.log
   try {
@@ -147,16 +155,29 @@ const readLog = async () => {
     } else {
       userPath = path.join(process.env.WINEPREFIX, 'drive_c/users', process.env.USER)
     }
-    const gameNames = await detectGameLocale(userPath)
+    const gameNames = await detectGameType(userPath)
     if (!gameNames.length) {
       sendMsg(text.file.notFound)
       return false
     }
     const promises = gameNames.map(async name => {
-      const logText = await fs.readFile(`${userPath}/AppData/LocalLow/miHoYo/${name}/output_log.txt`, 'utf8')
-      const arr = logText.match(/^OnGetWebViewPageFinish:https:\/\/.+\?.+?(?:#.+)?$/mg)
-      if (arr && arr.length) {
-        return arr[arr.length - 1].replace('OnGetWebViewPageFinish:', '')
+      if (name === 'cloud') {
+        const cacheText = await fs.readFile(path.join(userPath, '/AppData/Local/', 'miHoYo/GenshinImpactCloudGame/config/logs/MiHoYoSDK.log'), 'utf8')
+        const urlMch = cacheText.match(/https.+?auth_appid=webview_gacha.+?authkey=.+?game_biz=hk4e_\w+/g)
+        if (urlMch) {
+          return urlMch[urlMch.length - 1]
+        }
+      } else {
+        const logText = await fs.readFile(`${userPath}/AppData/LocalLow/miHoYo/${name}/output_log.txt`, 'utf8')
+        const gamePathMch = logText.match(/\w:\/.+(GenshinImpact_Data|YuanShen_Data)/)
+        if (gamePathMch) {
+          const [cacheText, cacheFile] = await getCacheText(gamePathMch[0])
+          const urlMch = cacheText.match(/https.+?auth_appid=webview_gacha.+?authkey=.+?game_biz=hk4e_\w+/g)
+          if (urlMch) {
+            cacheFolder = cacheFile.replace(/Cache_Data[/\\]data_2$/, '')
+            return urlMch[urlMch.length - 1]
+          }
+        }
       }
     })
     const result = await Promise.all(promises)
@@ -191,14 +212,14 @@ const getGachaLog = async ({ key, page, name, retryCount, url, endId }) => {
   }
 }
 
-const getGachaLogs = async ({ name, key }, queryString) => {
+const getGachaLogs = async ([key, name], queryString) => {
   const text = i18n.log
   let page = 1
   let list = []
   let res = []
   let uid = 0
   let endId = 0
-  const url = `${apiDomain}/event/gacha_info/api/getGachaLog?${queryString}`
+  const url = `${apiDomain}/gacha_info/api/getGachaLog?${queryString}`
   do {
     if (page % 10 === 0) {
       sendMsg(i18n.parse(text.fetch.interval, { name, page }))
@@ -247,15 +268,17 @@ const checkResStatus = (res) => {
     let message = res.message
     if (res.message === 'authkey timeout') {
       message = text.fetch.authTimeout
+      sendMsg(true, 'AUTHKEY_TIMEOUT')
     }
     sendMsg(message)
     throw new Error(message)
   }
+  sendMsg(false, 'AUTHKEY_TIMEOUT')
   return res
 }
 
 const tryGetUid = async (queryString) => {
-  const url = `${apiDomain}/event/gacha_info/api/getGachaLog?${queryString}`
+  const url = `${apiDomain}/gacha_info/api/getGachaLog?${queryString}`
   try {
     for (let [key] of defaultTypeMap) {
       const res = await request(`${url}&gacha_type=${key}&page=1&size=6`)
@@ -268,34 +291,24 @@ const tryGetUid = async (queryString) => {
   return config.current
 }
 
-const getGachaType = async (queryString) => {
-  const text = i18n.log
-  const gachaTypeUrl = `${apiDomain}/event/gacha_info/api/getConfigList?${queryString}`
-  sendMsg(text.fetch.gachaType)
-  const res = await request(gachaTypeUrl)
-  checkResStatus(res)
-  const gachaTypes = res.data.gacha_type_list
-  const orderedGachaTypes = []
-  order.forEach(key => {
-    const index = gachaTypes.findIndex(item => item.key === key)
-    if (index !== -1)  {
-      orderedGachaTypes.push(gachaTypes.splice(index, 1)[0])
-    }
-  })
-  orderedGachaTypes.push(...gachaTypes)
-  sendMsg(text.fetch.gachaTypeOk)
-  return orderedGachaTypes
+const fixAuthkey = (url) => {
+  const mr = url.match(/authkey=([^&]+)/)
+  if (mr && mr[1] && mr[1].includes('=') && !mr[1].includes('%')) {
+    return url.replace(/authkey=([^&]+)/, `authkey=${encodeURIComponent(mr[1])}`)
+  }
+  return url
 }
 
 const getQuerystring = (url) => {
   const text = i18n.log
-  const { searchParams, host } = new URL(url)
-  if (host.includes('webstatic-sea') || host.includes('hk4e-api-os')) {
-    apiDomain = 'https://hk4e-api-os.mihoyo.com'
+  const { searchParams, host } = new URL(fixAuthkey(url))
+  if (host.includes('webstatic-sea') || host.includes('hk4e-api-os') || host.includes('hoyoverse.com')) {
+    apiDomain = 'https://public-operation-hk4e-sg.hoyoverse.com'
   } else {
-    apiDomain = 'https://hk4e-api.mihoyo.com'
+    apiDomain = 'https://public-operation-hk4e.mihoyo.com'
   }
-  if (!searchParams.get('authkey')) {
+  const authkey = searchParams.get('authkey')
+  if (!authkey) {
     sendMsg(text.url.lackAuth)
     return false
   }
@@ -310,13 +323,13 @@ const proxyServer = (port) => {
   return new Promise((rev) => {
     mitmproxy.createProxy({
       sslConnectInterceptor: (req, cltSocket, head) => {
-        if (/webstatic([^\.]{2,10})?\.mihoyo\.com/.test(req.url)) {
+        if (/webstatic([^\.]{2,10})?\.(mihoyo|hoyoverse)\.com/.test(req.url)) {
           return true
         }
       },
       requestInterceptor: (rOptions, req, res, ssl, next) => {
         next()
-        if (/webstatic([^\.]{2,10})?\.mihoyo\.com/.test(rOptions.hostname)) {
+        if (/webstatic([^\.]{2,10})?\.(mihoyo|hoyoverse)\.com/.test(rOptions.hostname)) {
           if (/authkey=[^&]+/.test(rOptions.path)) {
             rev(`${rOptions.protocol}//${rOptions.hostname}${rOptions.path}`)
           }
@@ -346,53 +359,17 @@ const useProxy = async () => {
   return url
 }
 
-const getUrlFromConfig = () => {
-  if (config.urls.size) {
-    if (config.current && config.urls.has(config.current)) {
-      const url = config.urls.get(config.current)
-      return url
-    }
-  }
-}
-
 const tryRequest = async (url, retry = false) => {
   const queryString = getQuerystring(url)
   if (!queryString) return false
-  const gachaTypeUrl = `${apiDomain}/event/gacha_info/api/getConfigList?${queryString}`
-  try {
-    const res = await request(gachaTypeUrl)
-    if (res.retcode !== 0) {
-      return false
-    }
-    return true
-  } catch (e) {
-    if (e.code === 'ERR_PROXY_CONNECTION_FAILED' && !retry) {
-      await disableProxy()
-      return await tryRequest(url, true)
-    }
-    sendMsg(e.message.replace(url, '***'), 'ERROR')
-    throw e
-  }
+  const gachaTypeUrl = `${apiDomain}/gacha_info/api/getConfigList?${queryString}`
+  const res = await request(gachaTypeUrl)
+  checkResStatus(res)
 }
 
 const getUrl = async () => {
-  let url = getUrlFromConfig()
-  if (!url) {
-    url = await readLog()
-  } else {
-    const result = await tryRequest(url)
-    if (!result) {
-      url = await readLog()
-    }
-  }
-  if (!url && config.proxyMode) {
-    url = await useProxy()
-  } else if (url) {
-    const result = await tryRequest(url)
-    if (!result && config.proxyMode) {
-      url = await useProxy()
-    }
-  }
+  let url = await readLog()
+  await tryRequest(url)
   return url
 }
 
@@ -408,7 +385,7 @@ const fetchData = async (urlOverride) => {
     sendMsg(message)
     throw new Error(message)
   }
-  const searchParams = await getQuerystring(url)
+  const searchParams = getQuerystring(url)
   if (!searchParams) {
     const message = text.url.incorrect
     sendMsg(message)
@@ -416,16 +393,19 @@ const fetchData = async (urlOverride) => {
   }
   let queryString = searchParams.toString()
   const vUid = await tryGetUid(queryString)
-  const localLang = dataMap.has(vUid) ? dataMap.get(vUid).lang : ''
+  let localLang = dataMap.has(vUid) ? dataMap.get(vUid).lang : ''
   if (localLang) {
+    if (!localLang.startsWith('zh-')) {
+      localLang = localLang.replace(/-\w+$/, '')
+    }
     searchParams.set('lang', localLang)
   }
   queryString = searchParams.toString()
-  const gachaType = await getGachaType(queryString)
-
   const result = new Map()
   const typeMap = new Map()
   const lang = searchParams.get('lang')
+  console.log(lang)
+  const gachaType = getItemTypeNameMap(lang)
   let originUid = 0
   for (const type of gachaType) {
     const { list, uid } = await getGachaLogs(type, queryString)
@@ -433,8 +413,8 @@ const fetchData = async (urlOverride) => {
       return [item.time, item.name, item.item_type, parseInt(item.rank_type), item.gacha_type, item.id]
     })
     logs.reverse()
-    typeMap.set(type.key, type.name)
-    result.set(type.key, logs)
+    typeMap.set(type[0], type[1])
+    result.set(type[0], logs)
     if (!originUid) {
       originUid = uid
     }
@@ -482,6 +462,14 @@ ipcMain.handle('READ_DATA', async () => {
   }
 })
 
+ipcMain.handle('FORCE_READ_DATA', async () => {
+  await readData(true)
+  return {
+    dataMap,
+    current: config.current
+  }
+})
+
 ipcMain.handle('CHANGE_UID', (event, uid) => {
   config.current = uid
 })
@@ -507,6 +495,21 @@ ipcMain.handle('I18N_DATA', () => {
   return i18n.data
 })
 
+ipcMain.handle('OPEN_CACHE_FOLDER', () => {
+  if (cacheFolder) {
+    shell.openPath(cacheFolder)
+  }
+})
+
+ipcMain.handle('COPY_URL', async () => {
+  const url = await getUrl()
+  if (url) {
+    clipboard.writeText(url)
+    return true
+  }
+  return false
+})
+
 exports.getData = () => {
   return {
     dataMap,
@@ -514,3 +517,6 @@ exports.getData = () => {
   }
 }
 
+exports.saveData = saveData
+
+exports.changeCurrent = changeCurrent

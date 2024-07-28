@@ -9,7 +9,10 @@ const config = {
   proxyMode: false,
   autoUpdate: true,
   fetchFullHistory: false,
-  hideNovice: true
+  hideNovice: true,
+  gistsToken: '',
+  gistsId: '',
+  readableJSON: false
 }
 
 const getLocalConfig = async () => {

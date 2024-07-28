@@ -6,6 +6,10 @@ const crypto = require('crypto')
 const unhandled = require('electron-unhandled')
 const windowStateKeeper = require('electron-window-state')
 const debounce = require('lodash/debounce')
+const util = require('util')
+const { glob } = require('glob')
+
+const readdir = util.promisify(fs.readdir)
 
 const isDev = !app.isPackaged
 
@@ -129,6 +133,24 @@ const localeMap = new Map([
   ['vi-vn', ['vi']]
 ])
 
+const fixLocalMap = new Map([
+  ['en', 'en-us'],
+  ['fr', 'fr-fr'],
+  ['de', 'de-de'],
+  ['es', 'es-es'],
+  ['pt', 'pt-pt'],
+  ['ru', 'ru-ru'],
+  ['ja', 'ja-jp'],
+  ['ko', 'ko-kr'],
+  ['th', 'th-th'],
+  ['vi', 'vi-vn'],
+  ['id', 'id-id'],
+  ['zh-cn', 'zh-cn'],
+  ['zh-tw', 'zh-tw'],
+  ['tr', 'tr-tr'],
+  ['it', 'it-it']
+])
+
 const detectLocale = () => {
   const locale = app.getLocale()
   let result = 'zh-cn'
@@ -139,6 +161,10 @@ const detectLocale = () => {
     }
   }
   return result
+}
+
+function existsFile(name) {
+  return fs.existsSync(path.join(userDataPath, name))
 }
 
 const saveJSON = async (name, data) => {
@@ -199,8 +225,23 @@ const localIp = () => {
   return '127.0.0.1'
 }
 
+async function getCacheText(gamePath) {
+  const results = await glob(path.join(gamePath, '/webCaches{/,/*/}Cache/Cache_Data/data_2'), {
+    stat: true,
+		withFileTypes: true,
+    nodir: true,
+    windowsPathsNoEscape: true
+  })
+  const timeSortedFiles = results
+    .sort((a, b) => b.mtimeMs - a.mtimeMs)
+    .map(path => path.fullpath())
+  const cacheText = await fs.readFile(path.join(timeSortedFiles[0]), 'utf8')
+
+  return [cacheText, timeSortedFiles[0]]
+}
+
 module.exports = {
-  sleep, request, hash, cipherAes, decipherAes, saveLog,
-  sendMsg, readJSON, saveJSON, initWindow, getWin, localIp, userPath, detectLocale, langMap,
-  appRoot, userDataPath
+  readdir, sleep, request, hash, cipherAes, decipherAes, saveLog,
+  sendMsg, existsFile, readJSON, saveJSON, initWindow, getWin, localIp, userPath, detectLocale, langMap, fixLocalMap,
+  getCacheText, appRoot, userDataPath
 }
